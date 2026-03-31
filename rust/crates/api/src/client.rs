@@ -305,48 +305,40 @@ struct AnthropicErrorBody {
 #[cfg(test)]
 mod tests {
     use super::{ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER};
+    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
     use crate::types::{ContentBlockDelta, MessageRequest};
 
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock should not be poisoned")
+    }
+
     #[test]
     fn read_api_key_requires_presence() {
-        let previous_auth = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
-        let previous_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        let _guard = env_lock();
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
         let error = super::read_api_key().expect_err("missing key should error");
         assert!(matches!(error, crate::error::ApiError::MissingApiKey));
-        match previous_auth {
-            Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
-            None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
-        }
-        match previous_key {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
     }
 
     #[test]
     fn read_api_key_requires_non_empty_value() {
-        let previous_auth = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
-        let previous_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        let _guard = env_lock();
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "");
         std::env::remove_var("ANTHROPIC_API_KEY");
         let error = super::read_api_key().expect_err("empty key should error");
         assert!(matches!(error, crate::error::ApiError::MissingApiKey));
-        match previous_auth {
-            Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
-            None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
-        }
-        match previous_key {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
     }
 
     #[test]
     fn read_api_key_prefers_api_key_env() {
+        let _guard = env_lock();
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
         std::env::set_var("ANTHROPIC_API_KEY", "legacy-key");
         assert_eq!(
@@ -359,6 +351,7 @@ mod tests {
 
     #[test]
     fn read_auth_token_reads_auth_token_env() {
+        let _guard = env_lock();
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
         assert_eq!(super::read_auth_token().as_deref(), Some("auth-token"));
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");

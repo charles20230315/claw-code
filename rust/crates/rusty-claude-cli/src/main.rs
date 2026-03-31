@@ -5,7 +5,6 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::{
     AnthropicClient, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
@@ -13,21 +12,22 @@ use api::{
     ToolResultContentBlock,
 };
 
-use commands::handle_slash_command;
+use commands::{
+    handle_slash_command, render_slash_command_help, resume_supported_slash_commands, SlashCommand,
+};
 use compat_harness::{extract_manifest, UpstreamPaths};
 use render::{Spinner, TerminalRenderer};
 use runtime::{
-    estimate_session_tokens, load_system_prompt, ApiClient, ApiRequest, AssistantEvent,
-    CompactionConfig, ContentBlock, ConversationMessage, ConversationRuntime, MessageRole,
-    PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
-    PermissionRequest, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    load_system_prompt, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
+    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, MessageRole,
+    PermissionMode, PermissionPolicy, ProjectContext, RuntimeError, Session, TokenUsage, ToolError,
+    ToolExecutor, UsageTracker,
 };
 use tools::{execute_tool, mvp_tool_specs};
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 const DEFAULT_MAX_TOKENS: u32 = 32;
 const DEFAULT_DATE: &str = "2026-03-31";
-const DEFAULT_SESSION_LIMIT: usize = 20;
 
 fn main() {
     if let Err(error) = run() {
@@ -44,11 +44,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::PrintSystemPrompt { cwd, date } => print_system_prompt(cwd, date),
         CliAction::ResumeSession {
             session_path,
-            command,
-        } => resume_session(&session_path, command),
-        CliAction::ResumeNamed { target, command } => resume_named_session(&target, command),
-        CliAction::InspectSession { target } => inspect_session(&target),
-        CliAction::ListSessions { query, limit } => list_sessions(query.as_deref(), limit),
+            commands,
+        } => resume_session(&session_path, &commands),
         CliAction::Prompt { prompt, model } => LiveCli::new(model, false)?.run_turn(&prompt)?,
         CliAction::Repl { model } => run_repl(model)?,
         CliAction::Help => print_help(),
@@ -66,18 +63,7 @@ enum CliAction {
     },
     ResumeSession {
         session_path: PathBuf,
-        command: Option<String>,
-    },
-    ResumeNamed {
-        target: String,
-        command: Option<String>,
-    },
-    InspectSession {
-        target: String,
-    },
-    ListSessions {
-        query: Option<String>,
-        limit: usize,
+        commands: Vec<String>,
     },
     Prompt {
         prompt: String,
@@ -127,9 +113,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     match rest[0].as_str() {
         "dump-manifests" => Ok(CliAction::DumpManifests),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan),
-        "resume" => parse_named_resume_args(&rest[1..]),
-        "session" => parse_session_inspect_args(&rest[1..]),
-        "sessions" => parse_sessions_args(&rest[1..]),
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
         "prompt" => {
             let prompt = rest[1..].join(" ");
@@ -170,71 +153,21 @@ fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
     Ok(CliAction::PrintSystemPrompt { cwd, date })
 }
 
-fn parse_named_resume_args(args: &[String]) -> Result<CliAction, String> {
-    let target = args
-        .first()
-        .ok_or_else(|| "missing session id, path, or 'latest' for resume".to_string())?
-        .clone();
-    let command = args.get(1).cloned();
-    if args.len() > 2 {
-        return Err("resume accepts at most one trailing slash command".to_string());
-    }
-    Ok(CliAction::ResumeNamed { target, command })
-}
-
-fn parse_session_inspect_args(args: &[String]) -> Result<CliAction, String> {
-    let target = args
-        .first()
-        .ok_or_else(|| "missing session id, path, or 'latest' for session".to_string())?
-        .clone();
-    if args.len() > 1 {
-        return Err("session accepts exactly one target argument".to_string());
-    }
-    Ok(CliAction::InspectSession { target })
-}
-
-fn parse_sessions_args(args: &[String]) -> Result<CliAction, String> {
-    let mut query = None;
-    let mut limit = DEFAULT_SESSION_LIMIT;
-    let mut index = 0;
-
-    while index < args.len() {
-        match args[index].as_str() {
-            "--query" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --query".to_string())?;
-                query = Some(value.clone());
-                index += 2;
-            }
-            "--limit" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --limit".to_string())?;
-                limit = value
-                    .parse::<usize>()
-                    .map_err(|error| format!("invalid --limit value: {error}"))?;
-                index += 2;
-            }
-            other => return Err(format!("unknown sessions option: {other}")),
-        }
-    }
-
-    Ok(CliAction::ListSessions { query, limit })
-}
-
 fn parse_resume_args(args: &[String]) -> Result<CliAction, String> {
     let session_path = args
         .first()
         .ok_or_else(|| "missing session path for --resume".to_string())
         .map(PathBuf::from)?;
-    let command = args.get(1).cloned();
-    if args.len() > 2 {
-        return Err("--resume accepts at most one trailing slash command".to_string());
+    let commands = args[1..].to_vec();
+    if commands
+        .iter()
+        .any(|command| !command.trim_start().starts_with('/'))
+    {
+        return Err("--resume trailing arguments must be slash commands".to_string());
     }
     Ok(CliAction::ResumeSession {
         session_path,
-        command,
+        commands,
     })
 }
 
@@ -270,7 +203,7 @@ fn print_system_prompt(cwd: PathBuf, date: String) {
     }
 }
 
-fn resume_session(session_path: &Path, command: Option<String>) {
+fn resume_session(session_path: &Path, commands: &[String]) {
     let session = match Session::load_from_path(session_path) {
         Ok(session) => session,
         Err(error) => {
@@ -279,123 +212,183 @@ fn resume_session(session_path: &Path, command: Option<String>) {
         }
     };
 
+    if commands.is_empty() {
+        println!(
+            "Restored session from {} ({} messages).",
+            session_path.display(),
+            session.messages.len()
+        );
+        return;
+    }
+
+    let mut session = session;
+    for raw_command in commands {
+        let Some(command) = SlashCommand::parse(raw_command) else {
+            eprintln!("unsupported resumed command: {raw_command}");
+            std::process::exit(2);
+        };
+        match run_resume_command(session_path, &session, &command) {
+            Ok(ResumeCommandOutcome {
+                session: next_session,
+                message,
+            }) => {
+                session = next_session;
+                if let Some(message) = message {
+                    println!("{message}");
+                }
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResumeCommandOutcome {
+    session: Session,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StatusContext {
+    cwd: PathBuf,
+    session_path: Option<PathBuf>,
+    loaded_config_files: usize,
+    discovered_config_files: usize,
+    memory_file_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StatusUsage {
+    message_count: usize,
+    turns: u32,
+    latest: TokenUsage,
+    cumulative: TokenUsage,
+    estimated_tokens: usize,
+}
+
+fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
+    format!(
+        "Model
+  Current model    {model}
+  Session messages {message_count}
+  Session turns    {turns}
+
+Usage
+  Inspect current model with /model
+  Switch models with /model <name>"
+    )
+}
+
+fn format_model_switch_report(previous: &str, next: &str, message_count: usize) -> String {
+    format!(
+        "Model updated
+  Previous         {previous}
+  Current          {next}
+  Preserved msgs   {message_count}"
+    )
+}
+
+fn run_resume_command(
+    session_path: &Path,
+    session: &Session,
+    command: &SlashCommand,
+) -> Result<ResumeCommandOutcome, Box<dyn std::error::Error>> {
     match command {
-        Some(command) if command.starts_with('/') => {
+        SlashCommand::Help => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_repl_help()),
+        }),
+        SlashCommand::Compact => {
             let Some(result) = handle_slash_command(
-                &command,
-                &session,
+                "/compact",
+                session,
                 CompactionConfig {
                     max_estimated_tokens: 0,
                     ..CompactionConfig::default()
                 },
             ) else {
-                eprintln!("unknown slash command: {command}");
-                std::process::exit(2);
+                return Ok(ResumeCommandOutcome {
+                    session: session.clone(),
+                    message: None,
+                });
             };
-            if let Err(error) = result.session.save_to_path(session_path) {
-                eprintln!("failed to persist resumed session: {error}");
-                std::process::exit(1);
+            result.session.save_to_path(session_path)?;
+            Ok(ResumeCommandOutcome {
+                session: result.session,
+                message: Some(result.message),
+            })
+        }
+        SlashCommand::Clear { confirm } => {
+            if !confirm {
+                return Ok(ResumeCommandOutcome {
+                    session: session.clone(),
+                    message: Some(
+                        "clear: confirmation required; rerun with /clear --confirm".to_string(),
+                    ),
+                });
             }
-            println!("{}", result.message);
+            let cleared = Session::new();
+            cleared.save_to_path(session_path)?;
+            Ok(ResumeCommandOutcome {
+                session: cleared,
+                message: Some(format!(
+                    "Cleared resumed session file {}.",
+                    session_path.display()
+                )),
+            })
         }
-        Some(other) => {
-            eprintln!("unsupported resumed command: {other}");
-            std::process::exit(2);
+        SlashCommand::Status => {
+            let tracker = UsageTracker::from_session(session);
+            let usage = tracker.cumulative_usage();
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format_status_report(
+                    "restored-session",
+                    StatusUsage {
+                        message_count: session.messages.len(),
+                        turns: tracker.turns(),
+                        latest: tracker.current_turn_usage(),
+                        cumulative: usage,
+                        estimated_tokens: 0,
+                    },
+                    permission_mode_label(),
+                    &status_context(Some(session_path))?,
+                )),
+            })
         }
-        None => {
-            println!(
-                "Restored session from {} ({} messages).",
-                session_path.display(),
-                session.messages.len()
-            );
+        SlashCommand::Cost => {
+            let usage = UsageTracker::from_session(session).cumulative_usage();
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format!(
+                    "cost: input_tokens={} output_tokens={} cache_creation_tokens={} cache_read_tokens={} total_tokens={}",
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_creation_input_tokens,
+                    usage.cache_read_input_tokens,
+                    usage.total_tokens(),
+                )),
+            })
         }
-    }
-}
-
-fn resume_named_session(target: &str, command: Option<String>) {
-    let session_path = match resolve_session_target(target) {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-    };
-    resume_session(&session_path, command);
-}
-
-fn list_sessions(query: Option<&str>, limit: usize) {
-    match load_session_entries(query, limit) {
-        Ok(entries) => {
-            if entries.is_empty() {
-                println!("No saved sessions found.");
-                return;
-            }
-            println!("Saved sessions:");
-            for entry in entries {
-                println!(
-                    "- {} | updated={} | messages={} | tokens={} | {}",
-                    entry.id,
-                    entry.updated_unix,
-                    entry.message_count,
-                    entry.total_tokens,
-                    entry.preview
-                );
-            }
-        }
-        Err(error) => {
-            eprintln!("failed to list sessions: {error}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn inspect_session(target: &str) {
-    let path = match resolve_session_target(target) {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-    };
-
-    let session = match Session::load_from_path(&path) {
-        Ok(session) => session,
-        Err(error) => {
-            eprintln!("failed to load session: {error}");
-            std::process::exit(1);
-        }
-    };
-
-    let metadata = fs::metadata(&path).ok();
-    let updated_unix = metadata
-        .as_ref()
-        .and_then(|meta| meta.modified().ok())
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |duration| duration.as_secs());
-    let bytes = metadata.as_ref().map_or(0, std::fs::Metadata::len);
-    let usage = runtime::UsageTracker::from_session(&session).cumulative_usage();
-
-    println!("Session details:");
-    println!(
-        "- id: {}",
-        path.file_stem()
-            .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned())
-    );
-    println!("- path: {}", path.display());
-    println!("- updated: {updated_unix}");
-    println!("- size_bytes: {bytes}");
-    println!("- messages: {}", session.messages.len());
-    println!("- total_tokens: {}", usage.total_tokens());
-    for line in usage.summary_lines_for_model("- usage", None) {
-        println!("{line}");
-    }
-    println!("- preview: {}", session_preview(&session));
-
-    if let Some(user_text) = latest_text_for_role(&session, MessageRole::User) {
-        println!("- latest_user: {user_text}");
-    }
-    if let Some(assistant_text) = latest_text_for_role(&session, MessageRole::Assistant) {
-        println!("- latest_assistant: {assistant_text}");
+        SlashCommand::Config => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_config_report()?),
+        }),
+        SlashCommand::Memory => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_memory_report()?),
+        }),
+        SlashCommand::Init => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(init_claude_md()?),
+        }),
+        SlashCommand::Resume { .. }
+        | SlashCommand::Model { .. }
+        | SlashCommand::Permissions { .. }
+        | SlashCommand::Unknown(_) => Err("unsupported resumed slash command".into()),
     }
 }
 
@@ -410,23 +403,14 @@ fn run_repl(model: String) -> Result<(), Box<dyn std::error::Error>> {
         if trimmed.is_empty() {
             continue;
         }
-        match trimmed {
-            "/exit" | "/quit" => break,
-            "/help" => {
-                println!("Available commands:");
-                println!("  /help         Show help");
-                println!("  /status       Show session status");
-                println!("  /tools        Show tool catalog and permission policy");
-                println!("  /permissions  Show permission mode details");
-                println!("  /compact      Compact session history");
-                println!("  /exit         Quit the REPL");
-            }
-            "/status" => cli.print_status(),
-            "/tools" => cli.print_tools(),
-            "/permissions" => cli.print_permissions(),
-            "/compact" => cli.compact()?,
-            _ => cli.run_turn(trimmed)?,
+        if matches!(trimmed, "/exit" | "/quit") {
+            break;
         }
+        if let Some(command) = SlashCommand::parse(trimmed) {
+            cli.handle_repl_command(command)?;
+            continue;
+        }
+        cli.run_turn(trimmed)?;
     }
 
     Ok(())
@@ -436,28 +420,21 @@ struct LiveCli {
     model: String,
     system_prompt: Vec<String>,
     runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
-    session_path: PathBuf,
-    permission_policy: PermissionPolicy,
 }
 
 impl LiveCli {
     fn new(model: String, enable_tools: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
-        let session_path = new_session_path()?;
-        let permission_policy = permission_policy_from_env();
         let runtime = build_runtime(
             Session::new(),
             model.clone(),
             system_prompt.clone(),
             enable_tools,
-            permission_policy.clone(),
         )?;
         Ok(Self {
             model,
             system_prompt,
             runtime,
-            session_path,
-            permission_policy,
         })
     }
 
@@ -469,18 +446,15 @@ impl LiveCli {
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
-        let mut permission_prompter = CliPermissionPrompter::new();
-        let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = self.runtime.run_turn(input, None);
         match result {
-            Ok(turn) => {
+            Ok(_) => {
                 spinner.finish(
                     "Claude response complete",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
                 println!();
-                self.persist_session()?;
-                self.print_turn_usage(turn.usage);
                 Ok(())
             }
             Err(error) => {
@@ -494,247 +468,433 @@ impl LiveCli {
         }
     }
 
+    fn handle_repl_command(
+        &mut self,
+        command: SlashCommand,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match command {
+            SlashCommand::Help => println!("{}", render_repl_help()),
+            SlashCommand::Status => self.print_status(),
+            SlashCommand::Compact => self.compact()?,
+            SlashCommand::Model { model } => self.set_model(model)?,
+            SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
+            SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
+            SlashCommand::Cost => self.print_cost(),
+            SlashCommand::Resume { session_path } => self.resume_session(session_path)?,
+            SlashCommand::Config => Self::print_config()?,
+            SlashCommand::Memory => Self::print_memory()?,
+            SlashCommand::Init => Self::run_init()?,
+            SlashCommand::Unknown(name) => eprintln!("unknown slash command: /{name}"),
+        }
+        Ok(())
+    }
+
     fn print_status(&self) {
-        let usage = self.runtime.usage().cumulative_usage();
-        println!(
-            "status: messages={} turns={} estimated_session_tokens={}",
-            self.runtime.session().messages.len(),
-            self.runtime.usage().turns(),
-            self.runtime.estimated_tokens()
-        );
-        for line in usage.summary_lines_for_model("usage", Some(&self.model)) {
-            println!("{line}");
-        }
-    }
-
-    fn print_turn_usage(&self, cumulative_usage: TokenUsage) {
+        let cumulative = self.runtime.usage().cumulative_usage();
         let latest = self.runtime.usage().current_turn_usage();
-        println!("\nTurn usage:");
-        for line in latest.summary_lines_for_model("  latest", Some(&self.model)) {
-            println!("{line}");
-        }
-        println!("Cumulative usage:");
-        for line in cumulative_usage.summary_lines_for_model("  total", Some(&self.model)) {
-            println!("{line}");
-        }
-    }
-
-    fn print_permissions(&self) {
-        let mode = env::var("RUSTY_CLAUDE_PERMISSION_MODE")
-            .unwrap_or_else(|_| "workspace-write".to_string());
-        println!("Permission mode: {mode}");
         println!(
-            "Default policy: {}",
-            permission_mode_label(self.permission_policy.mode_for("bash"))
+            "{}",
+            format_status_report(
+                &self.model,
+                StatusUsage {
+                    message_count: self.runtime.session().messages.len(),
+                    turns: self.runtime.usage().turns(),
+                    latest,
+                    cumulative,
+                    estimated_tokens: self.runtime.estimated_tokens(),
+                },
+                permission_mode_label(),
+                &status_context(None).expect("status context should load"),
+            )
         );
-        println!("Read-only safe tools stay auto-allowed when read-only mode is active.");
-        println!("Interactive approvals appear when permission mode is set to prompt.");
     }
 
-    fn print_tools(&self) {
-        println!("Tool catalog:");
-        for spec in mvp_tool_specs() {
-            let mode = self.permission_policy.mode_for(spec.name);
-            let summary = summarize_tool_schema(&spec.input_schema);
+    fn set_model(&mut self, model: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(model) = model else {
             println!(
-                "- {} [{}] — {}{}",
-                spec.name,
-                permission_mode_label(mode),
-                spec.description,
-                if summary.is_empty() {
-                    String::new()
-                } else {
-                    format!(" | args: {summary}")
-                }
+                "{}",
+                format_model_report(
+                    &self.model,
+                    self.runtime.session().messages.len(),
+                    self.runtime.usage().turns(),
+                )
             );
+            return Ok(());
+        };
+
+        if model == self.model {
+            println!(
+                "{}",
+                format_model_report(
+                    &self.model,
+                    self.runtime.session().messages.len(),
+                    self.runtime.usage().turns(),
+                )
+            );
+            return Ok(());
         }
+
+        let previous = self.model.clone();
+        let session = self.runtime.session().clone();
+        let message_count = session.messages.len();
+        self.runtime = build_runtime(session, model.clone(), self.system_prompt.clone(), true)?;
+        self.model.clone_from(&model);
+        println!(
+            "{}",
+            format_model_switch_report(&previous, &model, message_count)
+        );
+        Ok(())
     }
 
-    fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let estimated_before = self.runtime.estimated_tokens();
-        let result = self.runtime.compact(CompactionConfig::default());
-        let removed = result.removed_message_count;
-        let estimated_after = estimate_session_tokens(&result.compacted_session);
-        let formatted_summary = result.formatted_summary.clone();
-        let compacted_session = result.compacted_session;
+    fn set_permissions(&mut self, mode: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(mode) = mode else {
+            println!("Current permission mode: {}", permission_mode_label());
+            return Ok(());
+        };
 
-        self.runtime = build_runtime(
-            compacted_session,
+        let normalized = normalize_permission_mode(&mode).ok_or_else(|| {
+            format!(
+                "Unsupported permission mode '{mode}'. Use read-only, workspace-write, or danger-full-access."
+            )
+        })?;
+
+        if normalized == permission_mode_label() {
+            println!("Permission mode already set to {normalized}.");
+            return Ok(());
+        }
+
+        let session = self.runtime.session().clone();
+        self.runtime = build_runtime_with_permission_mode(
+            session,
             self.model.clone(),
             self.system_prompt.clone(),
             true,
-            self.permission_policy.clone(),
+            normalized,
         )?;
-
-        if removed == 0 {
-            println!("Compaction skipped: session is below the compaction threshold.");
-        } else {
-            println!("Compacted {removed} messages into a resumable system summary.");
-            if !formatted_summary.is_empty() {
-                println!("\n{formatted_summary}");
-            }
-            let estimated_saved = estimated_before.saturating_sub(estimated_after);
-            println!("Estimated tokens saved: {estimated_saved}");
-        }
-        self.persist_session()?;
+        println!("Switched permission mode to {normalized}.");
         Ok(())
     }
 
-    fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.session().save_to_path(&self.session_path)?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionListEntry {
-    id: String,
-    path: PathBuf,
-    updated_unix: u64,
-    message_count: usize,
-    total_tokens: u32,
-    preview: String,
-}
-
-fn new_session_path() -> io::Result<PathBuf> {
-    let session_dir = default_session_dir()?;
-    fs::create_dir_all(&session_dir)?;
-    let timestamp = current_unix_timestamp();
-    let process_id = std::process::id();
-    Ok(session_dir.join(format!("session-{timestamp}-{process_id}.json")))
-}
-
-fn default_session_dir() -> io::Result<PathBuf> {
-    Ok(env::current_dir()?.join(".rusty-claude").join("sessions"))
-}
-
-fn current_unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
-}
-
-fn resolve_session_target(target: &str) -> io::Result<PathBuf> {
-    let direct_path = PathBuf::from(target);
-    if direct_path.is_file() {
-        return Ok(direct_path);
-    }
-
-    let entries = load_session_entries(None, usize::MAX)?;
-    if target == "latest" {
-        return entries
-            .into_iter()
-            .next()
-            .map(|entry| entry.path)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no saved sessions found"));
-    }
-
-    let mut matches = entries
-        .into_iter()
-        .filter(|entry| entry.id.contains(target) || entry.preview.contains(target))
-        .collect::<Vec<_>>();
-    if matches.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no saved session matched '{target}'"),
-        ));
-    }
-    matches.sort_by(|left, right| right.updated_unix.cmp(&left.updated_unix));
-    Ok(matches.remove(0).path)
-}
-
-fn load_session_entries(query: Option<&str>, limit: usize) -> io::Result<Vec<SessionListEntry>> {
-    let session_dir = default_session_dir()?;
-    if !session_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let query = query.map(str::to_lowercase);
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(session_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
+    fn clear_session(&mut self, confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if !confirm {
+            println!(
+                "clear: confirmation required; run /clear --confirm to start a fresh session."
+            );
+            return Ok(());
         }
 
-        let Ok(session) = Session::load_from_path(&path) else {
-            continue;
+        self.runtime = build_runtime_with_permission_mode(
+            Session::new(),
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            permission_mode_label(),
+        )?;
+        println!("Cleared local session history.");
+        Ok(())
+    }
+
+    fn print_cost(&self) {
+        let cumulative = self.runtime.usage().cumulative_usage();
+        println!(
+            "cost: input_tokens={} output_tokens={} cache_creation_tokens={} cache_read_tokens={} total_tokens={}",
+            cumulative.input_tokens,
+            cumulative.output_tokens,
+            cumulative.cache_creation_input_tokens,
+            cumulative.cache_read_input_tokens,
+            cumulative.total_tokens(),
+        );
+    }
+
+    fn resume_session(
+        &mut self,
+        session_path: Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(session_path) = session_path else {
+            println!("Usage: /resume <session-path>");
+            return Ok(());
         };
 
-        let preview = session_preview(&session);
-        let id = path
-            .file_stem()
-            .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
-        let searchable = format!("{} {}", id.to_lowercase(), preview.to_lowercase());
-        if let Some(query) = &query {
-            if !searchable.contains(query) {
-                continue;
-            }
-        }
-
-        let updated_unix = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |duration| duration.as_secs());
-
-        entries.push(SessionListEntry {
-            id,
-            path,
-            updated_unix,
-            message_count: session.messages.len(),
-            total_tokens: runtime::UsageTracker::from_session(&session)
-                .cumulative_usage()
-                .total_tokens(),
-            preview,
-        });
+        let session = Session::load_from_path(&session_path)?;
+        let message_count = session.messages.len();
+        self.runtime = build_runtime_with_permission_mode(
+            session,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            permission_mode_label(),
+        )?;
+        println!("Resumed session from {session_path} ({message_count} messages).");
+        Ok(())
     }
 
-    entries.sort_by(|left, right| right.updated_unix.cmp(&left.updated_unix));
-    if limit < entries.len() {
-        entries.truncate(limit);
+    fn print_config() -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", render_config_report()?);
+        Ok(())
     }
-    Ok(entries)
+
+    fn print_memory() -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", render_memory_report()?);
+        Ok(())
+    }
+
+    fn run_init() -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", init_claude_md()?);
+        Ok(())
+    }
+
+    fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let result = self.runtime.compact(CompactionConfig::default());
+        let removed = result.removed_message_count;
+        self.runtime = build_runtime_with_permission_mode(
+            result.compacted_session,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            permission_mode_label(),
+        )?;
+        println!("Compacted {removed} messages.");
+        Ok(())
+    }
 }
 
-fn session_preview(session: &Session) -> String {
-    for message in session.messages.iter().rev() {
-        for block in &message.blocks {
-            if let ContentBlock::Text { text } = block {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    return truncate_preview(trimmed, 80);
-                }
-            }
-        }
-    }
-    "No text preview available".to_string()
+fn render_repl_help() -> String {
+    format!(
+        "{}
+  /exit                Quit the REPL",
+        render_slash_command_help()
+    )
 }
 
-fn latest_text_for_role(session: &Session, role: MessageRole) -> Option<String> {
-    session.messages.iter().rev().find_map(|message| {
-        if message.role != role {
-            return None;
-        }
-        message.blocks.iter().find_map(|block| match block {
-            ContentBlock::Text { text } => {
-                let trimmed = text.trim();
-                (!trimmed.is_empty()).then(|| truncate_preview(trimmed, 120))
-            }
-            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
-        })
+fn status_context(
+    session_path: Option<&Path>,
+) -> Result<StatusContext, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let discovered_config_files = loader.discover().len();
+    let runtime_config = loader.load()?;
+    let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
+    Ok(StatusContext {
+        cwd,
+        session_path: session_path.map(Path::to_path_buf),
+        loaded_config_files: runtime_config.loaded_entries().len(),
+        discovered_config_files,
+        memory_file_count: project_context.instruction_files.len(),
     })
 }
 
-fn truncate_preview(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
+fn format_status_report(
+    model: &str,
+    usage: StatusUsage,
+    permission_mode: &str,
+    context: &StatusContext,
+) -> String {
+    [
+        format!(
+            "Status
+  Model            {model}
+  Permission mode  {permission_mode}
+  Messages         {}
+  Turns            {}
+  Estimated tokens {}",
+            usage.message_count, usage.turns, usage.estimated_tokens,
+        ),
+        format!(
+            "Usage
+  Latest total     {}
+  Cumulative input {}
+  Cumulative output {}
+  Cumulative total {}",
+            usage.latest.total_tokens(),
+            usage.cumulative.input_tokens,
+            usage.cumulative.output_tokens,
+            usage.cumulative.total_tokens(),
+        ),
+        format!(
+            "Workspace
+  Cwd              {}
+  Session          {}
+  Config files     loaded {}/{}
+  Memory files     {}",
+            context.cwd.display(),
+            context.session_path.as_ref().map_or_else(
+                || "live-repl".to_string(),
+                |path| path.display().to_string()
+            ),
+            context.loaded_config_files,
+            context.discovered_config_files,
+            context.memory_file_count,
+        ),
+    ]
+    .join(
+        "
+
+",
+    )
+}
+
+fn render_config_report() -> Result<String, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let discovered = loader.discover();
+    let runtime_config = loader.load()?;
+
+    let mut lines = vec![
+        format!(
+            "Config
+  Working directory {}
+  Loaded files      {}
+  Merged keys       {}",
+            cwd.display(),
+            runtime_config.loaded_entries().len(),
+            runtime_config.merged().len()
+        ),
+        "Discovered files".to_string(),
+    ];
+    for entry in discovered {
+        let source = match entry.source {
+            ConfigSource::User => "user",
+            ConfigSource::Project => "project",
+            ConfigSource::Local => "local",
+        };
+        let status = if runtime_config
+            .loaded_entries()
+            .iter()
+            .any(|loaded_entry| loaded_entry.path == entry.path)
+        {
+            "loaded"
+        } else {
+            "missing"
+        };
+        lines.push(format!(
+            "  {source:<7} {status:<7} {}",
+            entry.path.display()
+        ));
     }
-    let mut output = text.chars().take(max_chars).collect::<String>();
-    output.push('…');
-    output
+    lines.push("Merged JSON".to_string());
+    lines.push(format!("  {}", runtime_config.as_json().render()));
+    Ok(lines.join(
+        "
+",
+    ))
+}
+
+fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
+    let project_context = ProjectContext::discover(env::current_dir()?, DEFAULT_DATE)?;
+    let mut lines = vec![format!(
+        "memory: files={}",
+        project_context.instruction_files.len()
+    )];
+    if project_context.instruction_files.is_empty() {
+        lines.push(
+            "  No CLAUDE instruction files discovered in the current directory ancestry."
+                .to_string(),
+        );
+    } else {
+        for file in project_context.instruction_files {
+            let preview = file.content.lines().next().unwrap_or("").trim();
+            let preview = if preview.is_empty() {
+                "<empty>"
+            } else {
+                preview
+            };
+            lines.push(format!(
+                "  {} ({}) {}",
+                file.path.display(),
+                file.content.lines().count(),
+                preview
+            ));
+        }
+    }
+    Ok(lines.join(
+        "
+",
+    ))
+}
+
+fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let claude_md = cwd.join("CLAUDE.md");
+    if claude_md.exists() {
+        return Ok(format!(
+            "init: skipped because {} already exists",
+            claude_md.display()
+        ));
+    }
+
+    let content = render_init_claude_md(&cwd);
+    fs::write(&claude_md, content)?;
+    Ok(format!("init: created {}", claude_md.display()))
+}
+
+fn render_init_claude_md(cwd: &Path) -> String {
+    let mut lines = vec![
+        "# CLAUDE.md".to_string(),
+        String::new(),
+        "This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.".to_string(),
+        String::new(),
+    ];
+
+    let mut command_lines = Vec::new();
+    if cwd.join("rust").join("Cargo.toml").is_file() {
+        command_lines.push("- Run Rust verification from `rust/`: `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`".to_string());
+    } else if cwd.join("Cargo.toml").is_file() {
+        command_lines.push("- Run Rust verification from the repo root: `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`".to_string());
+    }
+    if cwd.join("tests").is_dir() && cwd.join("src").is_dir() {
+        command_lines.push("- `src/` and `tests/` are also present; check those surfaces before removing or renaming Python-era compatibility assets.".to_string());
+    }
+    if !command_lines.is_empty() {
+        lines.push("## Verification".to_string());
+        lines.extend(command_lines);
+        lines.push(String::new());
+    }
+
+    let mut structure_lines = Vec::new();
+    if cwd.join("rust").is_dir() {
+        structure_lines.push(
+            "- `rust/` contains the Rust workspace and the active CLI/runtime implementation."
+                .to_string(),
+        );
+    }
+    if cwd.join("src").is_dir() {
+        structure_lines.push("- `src/` contains the older Python-first workspace artifacts referenced by the repo history and tests.".to_string());
+    }
+    if cwd.join("tests").is_dir() {
+        structure_lines.push("- `tests/` exercises compatibility and porting behavior across the repository surfaces.".to_string());
+    }
+    if !structure_lines.is_empty() {
+        lines.push("## Repository shape".to_string());
+        lines.extend(structure_lines);
+        lines.push(String::new());
+    }
+
+    lines.push("## Working agreement".to_string());
+    lines.push("- Prefer small, reviewable Rust changes and keep slash-command behavior aligned between the shared command registry and the CLI entrypoints.".to_string());
+    lines.push("- Do not overwrite existing CLAUDE.md content automatically; update it intentionally when repo workflows change.".to_string());
+    lines.push(String::new());
+
+    lines.join(
+        "
+",
+    )
+}
+
+fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
+    match mode.trim() {
+        "read-only" => Some("read-only"),
+        "workspace-write" => Some("workspace-write"),
+        "danger-full-access" => Some("danger-full-access"),
+        _ => None,
+    }
+}
+
+fn permission_mode_label() -> &'static str {
+    match env::var("RUSTY_CLAUDE_PERMISSION_MODE") {
+        Ok(value) if value == "read-only" => "read-only",
+        Ok(value) if value == "danger-full-access" => "danger-full-access",
+        _ => "workspace-write",
+    }
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -751,14 +911,30 @@ fn build_runtime(
     model: String,
     system_prompt: Vec<String>,
     enable_tools: bool,
-    permission_policy: PermissionPolicy,
+) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
+{
+    build_runtime_with_permission_mode(
+        session,
+        model,
+        system_prompt,
+        enable_tools,
+        permission_mode_label(),
+    )
+}
+
+fn build_runtime_with_permission_mode(
+    session: Session,
+    model: String,
+    system_prompt: Vec<String>,
+    enable_tools: bool,
+    permission_mode: &str,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     Ok(ConversationRuntime::new(
         session,
         AnthropicRuntimeClient::new(model, enable_tools)?,
         CliToolExecutor::new(),
-        permission_policy,
+        permission_policy(permission_mode),
         system_prompt,
     ))
 }
@@ -943,77 +1119,6 @@ fn response_to_events(
     Ok(events)
 }
 
-fn permission_mode_label(mode: PermissionMode) -> &'static str {
-    match mode {
-        PermissionMode::Allow => "allow",
-        PermissionMode::Deny => "deny",
-        PermissionMode::Prompt => "prompt",
-    }
-}
-
-fn summarize_tool_schema(schema: &serde_json::Value) -> String {
-    let Some(properties) = schema
-        .get("properties")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return String::new();
-    };
-    let mut keys = properties.keys().cloned().collect::<Vec<_>>();
-    keys.sort();
-    keys.join(", ")
-}
-
-fn summarize_tool_output(tool_name: &str, output: &str) -> String {
-    let compact = output.replace('\n', " ");
-    let preview = truncate_preview(compact.trim(), 120);
-    if preview.is_empty() {
-        format!("{tool_name} completed with no textual output")
-    } else {
-        format!("{tool_name} → {preview}")
-    }
-}
-
-struct CliPermissionPrompter {
-    prompt: String,
-}
-
-impl CliPermissionPrompter {
-    fn new() -> Self {
-        Self {
-            prompt: "Allow tool? [y]es / [n]o / [a]lways deny this run: ".to_string(),
-        }
-    }
-}
-
-impl PermissionPrompter for CliPermissionPrompter {
-    fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
-        println!(
-            "
-Tool permission request:"
-        );
-        println!("- tool: {}", request.tool_name);
-        println!("- input: {}", truncate_preview(request.input.trim(), 200));
-        print!("{}", self.prompt);
-        let _ = io::stdout().flush();
-
-        let mut response = String::new();
-        match io::stdin().read_line(&mut response) {
-            Ok(_) => match response.trim().to_ascii_lowercase().as_str() {
-                "y" | "yes" => PermissionPromptDecision::Allow,
-                "a" | "always" => PermissionPromptDecision::Deny {
-                    reason: "tool denied for this run by user".to_string(),
-                },
-                _ => PermissionPromptDecision::Deny {
-                    reason: "tool denied by user".to_string(),
-                },
-            },
-            Err(error) => PermissionPromptDecision::Deny {
-                reason: format!("tool approval failed: {error}"),
-            },
-        }
-    }
-}
-
 struct CliToolExecutor {
     renderer: TerminalRenderer,
 }
@@ -1032,10 +1137,7 @@ impl ToolExecutor for CliToolExecutor {
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         match execute_tool(tool_name, &value) {
             Ok(output) => {
-                let summary = summarize_tool_output(tool_name, &output);
-                let markdown = format!(
-                    "### Tool `{tool_name}`\n\n- Summary: {summary}\n\n```json\n{output}\n```\n"
-                );
+                let markdown = format!("### Tool `{tool_name}`\n\n```json\n{output}\n```\n");
                 self.renderer
                     .stream_markdown(&markdown, &mut io::stdout())
                     .map_err(|error| ToolError::new(error.to_string()))?;
@@ -1046,19 +1148,14 @@ impl ToolExecutor for CliToolExecutor {
     }
 }
 
-fn permission_policy_from_env() -> PermissionPolicy {
-    let mode =
-        env::var("RUSTY_CLAUDE_PERMISSION_MODE").unwrap_or_else(|_| "workspace-write".to_string());
-    match mode.as_str() {
-        "read-only" => PermissionPolicy::new(PermissionMode::Deny)
+fn permission_policy(mode: &str) -> PermissionPolicy {
+    if normalize_permission_mode(mode) == Some("read-only") {
+        PermissionPolicy::new(PermissionMode::Deny)
             .with_tool_mode("read_file", PermissionMode::Allow)
             .with_tool_mode("glob_search", PermissionMode::Allow)
-            .with_tool_mode("grep_search", PermissionMode::Allow),
-        "prompt" => PermissionPolicy::new(PermissionMode::Prompt)
-            .with_tool_mode("read_file", PermissionMode::Allow)
-            .with_tool_mode("glob_search", PermissionMode::Allow)
-            .with_tool_mode("grep_search", PermissionMode::Allow),
-        _ => PermissionPolicy::new(PermissionMode::Allow),
+            .with_tool_mode("grep_search", PermissionMode::Allow)
+    } else {
+        PermissionPolicy::new(PermissionMode::Allow)
     }
 }
 
@@ -1107,27 +1204,43 @@ fn print_help() {
     println!("rusty-claude-cli");
     println!();
     println!("Usage:");
-    println!("  rusty-claude-cli [--model MODEL]             Start interactive REPL");
-    println!(
-        "  rusty-claude-cli [--model MODEL] prompt TEXT Send one prompt and stream the response"
-    );
+    println!("  rusty-claude-cli [--model MODEL]");
+    println!("      Start interactive REPL");
+    println!("  rusty-claude-cli [--model MODEL] prompt TEXT");
+    println!("      Send one prompt and stream the response");
+    println!("  rusty-claude-cli --resume SESSION.json [/status] [/compact] [...]");
+    println!("      Inspect or maintain a saved session without entering the REPL");
     println!("  rusty-claude-cli dump-manifests");
     println!("  rusty-claude-cli bootstrap-plan");
-    println!("  rusty-claude-cli sessions [--query TEXT] [--limit N]");
-    println!("  rusty-claude-cli session <latest|SESSION|PATH>");
-    println!("  rusty-claude-cli resume <latest|SESSION|PATH> [/compact]");
-    println!("  env RUSTY_CLAUDE_PERMISSION_MODE=prompt enables interactive tool approval");
     println!("  rusty-claude-cli system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
-    println!("  rusty-claude-cli --resume SESSION.json [/compact]");
+    println!();
+    println!("Interactive slash commands:");
+    println!("{}", render_slash_command_help());
+    println!();
+    let resume_commands = resume_supported_slash_commands()
+        .into_iter()
+        .map(|spec| match spec.argument_hint {
+            Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
+            None => format!("/{}", spec.name),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("Resume-safe commands: {resume_commands}");
+    println!("Examples:");
+    println!("  rusty-claude-cli --resume session.json /status /compact /cost");
+    println!("  rusty-claude-cli --resume session.json /memory /config");
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, resolve_session_target, session_preview, CliAction, DEFAULT_MODEL};
-    use runtime::{ContentBlock, ConversationMessage, MessageRole, Session};
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use super::{
+        format_model_report, format_model_switch_report, format_status_report,
+        normalize_permission_mode, parse_args, render_init_claude_md, render_repl_help,
+        resume_supported_slash_commands, status_context, CliAction, SlashCommand, StatusUsage,
+        DEFAULT_MODEL,
+    };
+    use runtime::{ContentBlock, ConversationMessage, MessageRole};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn defaults_to_repl_when_no_args() {
@@ -1184,54 +1297,185 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.json"),
-                command: Some("/compact".to_string()),
+                commands: vec!["/compact".to_string()],
             }
         );
     }
 
     #[test]
-    fn parses_session_inspect_subcommand() {
-        let args = vec!["session".to_string(), "latest".to_string()];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::InspectSession {
-                target: "latest".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn parses_sessions_subcommand() {
+    fn parses_resume_flag_with_multiple_slash_commands() {
         let args = vec![
-            "sessions".to_string(),
-            "--query".to_string(),
-            "compact".to_string(),
-            "--limit".to_string(),
-            "5".to_string(),
-        ];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::ListSessions {
-                query: Some("compact".to_string()),
-                limit: 5,
-            }
-        );
-    }
-
-    #[test]
-    fn parses_named_resume_subcommand() {
-        let args = vec![
-            "resume".to_string(),
-            "latest".to_string(),
+            "--resume".to_string(),
+            "session.json".to_string(),
+            "/status".to_string(),
             "/compact".to_string(),
+            "/cost".to_string(),
         ];
         assert_eq!(
             parse_args(&args).expect("args should parse"),
-            CliAction::ResumeNamed {
-                target: "latest".to_string(),
-                command: Some("/compact".to_string()),
+            CliAction::ResumeSession {
+                session_path: PathBuf::from("session.json"),
+                commands: vec![
+                    "/status".to_string(),
+                    "/compact".to_string(),
+                    "/cost".to_string(),
+                ],
             }
         );
+    }
+
+    #[test]
+    fn repl_help_includes_shared_commands_and_exit() {
+        let help = render_repl_help();
+        assert!(help.contains("/help"));
+        assert!(help.contains("/status"));
+        assert!(help.contains("/model [model]"));
+        assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
+        assert!(help.contains("/clear [--confirm]"));
+        assert!(help.contains("/cost"));
+        assert!(help.contains("/resume <session-path>"));
+        assert!(help.contains("/config"));
+        assert!(help.contains("/memory"));
+        assert!(help.contains("/init"));
+        assert!(help.contains("/exit"));
+    }
+
+    #[test]
+    fn resume_supported_command_list_matches_expected_surface() {
+        let names = resume_supported_slash_commands()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["help", "status", "compact", "clear", "cost", "config", "memory", "init",]
+        );
+    }
+
+    #[test]
+    fn model_report_uses_sectioned_layout() {
+        let report = format_model_report("claude-sonnet", 12, 4);
+        assert!(report.contains("Model"));
+        assert!(report.contains("Current model    claude-sonnet"));
+        assert!(report.contains("Session messages 12"));
+        assert!(report.contains("Switch models with /model <name>"));
+    }
+
+    #[test]
+    fn model_switch_report_preserves_context_summary() {
+        let report = format_model_switch_report("claude-sonnet", "claude-opus", 9);
+        assert!(report.contains("Model updated"));
+        assert!(report.contains("Previous         claude-sonnet"));
+        assert!(report.contains("Current          claude-opus"));
+        assert!(report.contains("Preserved msgs   9"));
+    }
+
+    #[test]
+    fn status_line_reports_model_and_token_totals() {
+        let status = format_status_report(
+            "claude-sonnet",
+            StatusUsage {
+                message_count: 7,
+                turns: 3,
+                latest: runtime::TokenUsage {
+                    input_tokens: 5,
+                    output_tokens: 4,
+                    cache_creation_input_tokens: 1,
+                    cache_read_input_tokens: 0,
+                },
+                cumulative: runtime::TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 8,
+                    cache_creation_input_tokens: 2,
+                    cache_read_input_tokens: 1,
+                },
+                estimated_tokens: 128,
+            },
+            "workspace-write",
+            &super::StatusContext {
+                cwd: PathBuf::from("/tmp/project"),
+                session_path: Some(PathBuf::from("session.json")),
+                loaded_config_files: 2,
+                discovered_config_files: 3,
+                memory_file_count: 4,
+            },
+        );
+        assert!(status.contains("Status"));
+        assert!(status.contains("Model            claude-sonnet"));
+        assert!(status.contains("Permission mode  workspace-write"));
+        assert!(status.contains("Messages         7"));
+        assert!(status.contains("Latest total     10"));
+        assert!(status.contains("Cumulative total 31"));
+        assert!(status.contains("Cwd              /tmp/project"));
+        assert!(status.contains("Session          session.json"));
+        assert!(status.contains("Config files     loaded 2/3"));
+        assert!(status.contains("Memory files     4"));
+    }
+
+    #[test]
+    fn config_report_uses_sectioned_layout() {
+        let report = super::render_config_report().expect("config report should render");
+        assert!(report.contains("Config"));
+        assert!(report.contains("Discovered files"));
+        assert!(report.contains("Merged JSON"));
+    }
+
+    #[test]
+    fn status_context_reads_real_workspace_metadata() {
+        let context = status_context(None).expect("status context should load");
+        assert!(context.cwd.is_absolute());
+        assert_eq!(context.discovered_config_files, 3);
+        assert!(context.loaded_config_files <= context.discovered_config_files);
+    }
+
+    #[test]
+    fn normalizes_supported_permission_modes() {
+        assert_eq!(normalize_permission_mode("read-only"), Some("read-only"));
+        assert_eq!(
+            normalize_permission_mode("workspace-write"),
+            Some("workspace-write")
+        );
+        assert_eq!(
+            normalize_permission_mode("danger-full-access"),
+            Some("danger-full-access")
+        );
+        assert_eq!(normalize_permission_mode("unknown"), None);
+    }
+
+    #[test]
+    fn clear_command_requires_explicit_confirmation_flag() {
+        assert_eq!(
+            SlashCommand::parse("/clear"),
+            Some(SlashCommand::Clear { confirm: false })
+        );
+        assert_eq!(
+            SlashCommand::parse("/clear --confirm"),
+            Some(SlashCommand::Clear { confirm: true })
+        );
+    }
+
+    #[test]
+    fn parses_resume_and_config_slash_commands() {
+        assert_eq!(
+            SlashCommand::parse("/resume saved-session.json"),
+            Some(SlashCommand::Resume {
+                session_path: Some("saved-session.json".to_string())
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/clear --confirm"),
+            Some(SlashCommand::Clear { confirm: true })
+        );
+        assert_eq!(SlashCommand::parse("/config"), Some(SlashCommand::Config));
+        assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory));
+        assert_eq!(SlashCommand::parse("/init"), Some(SlashCommand::Init));
+    }
+
+    #[test]
+    fn init_template_mentions_detected_rust_workspace() {
+        let rendered = render_init_claude_md(Path::new("."));
+        assert!(rendered.contains("# CLAUDE.md"));
+        assert!(rendered.contains("cargo clippy --workspace --all-targets -- -D warnings"));
     }
 
     #[test]
@@ -1259,31 +1503,5 @@ mod tests {
         assert_eq!(converted.len(), 3);
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
-    }
-
-    #[test]
-    fn builds_preview_from_latest_text_block() {
-        let session = Session {
-            version: 1,
-            messages: vec![
-                ConversationMessage::user_text("first"),
-                ConversationMessage::assistant(vec![ContentBlock::Text {
-                    text: "latest preview".to_string(),
-                }]),
-            ],
-        };
-        assert_eq!(session_preview(&session), "latest preview");
-    }
-
-    #[test]
-    fn resolves_direct_session_path() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        let path = std::env::temp_dir().join(format!("rusty-claude-session-{unique}.json"));
-        fs::write(&path, "{\"version\":1,\"messages\":[]}").expect("temp session");
-        let resolved = resolve_session_target(path.to_string_lossy().as_ref()).expect("resolve");
-        assert_eq!(resolved, path);
-        fs::remove_file(resolved).expect("cleanup");
     }
 }

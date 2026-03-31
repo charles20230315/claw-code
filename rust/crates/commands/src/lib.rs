@@ -30,6 +30,168 @@ impl CommandRegistry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlashCommandSpec {
+    pub name: &'static str,
+    pub summary: &'static str,
+    pub argument_hint: Option<&'static str>,
+    pub resume_supported: bool,
+}
+
+const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
+    SlashCommandSpec {
+        name: "help",
+        summary: "Show available slash commands",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "status",
+        summary: "Show current session status",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "compact",
+        summary: "Compact local session history",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "model",
+        summary: "Show or switch the active model",
+        argument_hint: Some("[model]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "permissions",
+        summary: "Show or switch the active permission mode",
+        argument_hint: Some("[read-only|workspace-write|danger-full-access]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "clear",
+        summary: "Start a fresh local session",
+        argument_hint: Some("[--confirm]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "cost",
+        summary: "Show cumulative token usage for this session",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "resume",
+        summary: "Load a saved session into the REPL",
+        argument_hint: Some("<session-path>"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "config",
+        summary: "Inspect discovered Claude config files",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "memory",
+        summary: "Inspect loaded Claude instruction memory files",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "init",
+        summary: "Create a starter CLAUDE.md for this repo",
+        argument_hint: None,
+        resume_supported: true,
+    },
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashCommand {
+    Help,
+    Status,
+    Compact,
+    Model { model: Option<String> },
+    Permissions { mode: Option<String> },
+    Clear { confirm: bool },
+    Cost,
+    Resume { session_path: Option<String> },
+    Config,
+    Memory,
+    Init,
+    Unknown(String),
+}
+
+impl SlashCommand {
+    #[must_use]
+    pub fn parse(input: &str) -> Option<Self> {
+        let trimmed = input.trim();
+        if !trimmed.starts_with('/') {
+            return None;
+        }
+
+        let mut parts = trimmed.trim_start_matches('/').split_whitespace();
+        let command = parts.next().unwrap_or_default();
+        Some(match command {
+            "help" => Self::Help,
+            "status" => Self::Status,
+            "compact" => Self::Compact,
+            "model" => Self::Model {
+                model: parts.next().map(ToOwned::to_owned),
+            },
+            "permissions" => Self::Permissions {
+                mode: parts.next().map(ToOwned::to_owned),
+            },
+            "clear" => Self::Clear {
+                confirm: parts.next() == Some("--confirm"),
+            },
+            "cost" => Self::Cost,
+            "resume" => Self::Resume {
+                session_path: parts.next().map(ToOwned::to_owned),
+            },
+            "config" => Self::Config,
+            "memory" => Self::Memory,
+            "init" => Self::Init,
+            other => Self::Unknown(other.to_string()),
+        })
+    }
+}
+
+#[must_use]
+pub fn slash_command_specs() -> &'static [SlashCommandSpec] {
+    SLASH_COMMAND_SPECS
+}
+
+#[must_use]
+pub fn resume_supported_slash_commands() -> Vec<&'static SlashCommandSpec> {
+    slash_command_specs()
+        .iter()
+        .filter(|spec| spec.resume_supported)
+        .collect()
+}
+
+#[must_use]
+pub fn render_slash_command_help() -> String {
+    let mut lines = vec![
+        "Available commands:".to_string(),
+        "  (resume-safe commands are marked with [resume])".to_string(),
+    ];
+    for spec in slash_command_specs() {
+        let name = match spec.argument_hint {
+            Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
+            None => format!("/{}", spec.name),
+        };
+        let resume = if spec.resume_supported {
+            " [resume]"
+        } else {
+            ""
+        };
+        lines.push(format!("  {name:<20} {}{}", spec.summary, resume));
+    }
+    lines.join("\n")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashCommandResult {
     pub message: String,
@@ -42,13 +204,8 @@ pub fn handle_slash_command(
     session: &Session,
     compaction: CompactionConfig,
 ) -> Option<SlashCommandResult> {
-    let trimmed = input.trim();
-    if !trimmed.starts_with('/') {
-        return None;
-    }
-
-    match trimmed.split_whitespace().next() {
-        Some("/compact") => {
+    match SlashCommand::parse(input)? {
+        SlashCommand::Compact => {
             let result = compact_session(session, compaction);
             let message = if result.removed_message_count == 0 {
                 "Compaction skipped: session is below the compaction threshold.".to_string()
@@ -63,14 +220,89 @@ pub fn handle_slash_command(
                 session: result.compacted_session,
             })
         }
-        _ => None,
+        SlashCommand::Help => Some(SlashCommandResult {
+            message: render_slash_command_help(),
+            session: session.clone(),
+        }),
+        SlashCommand::Status
+        | SlashCommand::Model { .. }
+        | SlashCommand::Permissions { .. }
+        | SlashCommand::Clear { .. }
+        | SlashCommand::Cost
+        | SlashCommand::Resume { .. }
+        | SlashCommand::Config
+        | SlashCommand::Memory
+        | SlashCommand::Init
+        | SlashCommand::Unknown(_) => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::handle_slash_command;
+    use super::{
+        handle_slash_command, render_slash_command_help, resume_supported_slash_commands,
+        slash_command_specs, SlashCommand,
+    };
     use runtime::{CompactionConfig, ContentBlock, ConversationMessage, MessageRole, Session};
+
+    #[test]
+    fn parses_supported_slash_commands() {
+        assert_eq!(SlashCommand::parse("/help"), Some(SlashCommand::Help));
+        assert_eq!(SlashCommand::parse(" /status "), Some(SlashCommand::Status));
+        assert_eq!(
+            SlashCommand::parse("/model claude-opus"),
+            Some(SlashCommand::Model {
+                model: Some("claude-opus".to_string()),
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/model"),
+            Some(SlashCommand::Model { model: None })
+        );
+        assert_eq!(
+            SlashCommand::parse("/permissions read-only"),
+            Some(SlashCommand::Permissions {
+                mode: Some("read-only".to_string()),
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/clear"),
+            Some(SlashCommand::Clear { confirm: false })
+        );
+        assert_eq!(
+            SlashCommand::parse("/clear --confirm"),
+            Some(SlashCommand::Clear { confirm: true })
+        );
+        assert_eq!(SlashCommand::parse("/cost"), Some(SlashCommand::Cost));
+        assert_eq!(
+            SlashCommand::parse("/resume session.json"),
+            Some(SlashCommand::Resume {
+                session_path: Some("session.json".to_string()),
+            })
+        );
+        assert_eq!(SlashCommand::parse("/config"), Some(SlashCommand::Config));
+        assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory));
+        assert_eq!(SlashCommand::parse("/init"), Some(SlashCommand::Init));
+    }
+
+    #[test]
+    fn renders_help_from_shared_specs() {
+        let help = render_slash_command_help();
+        assert!(help.contains("resume-safe commands"));
+        assert!(help.contains("/help"));
+        assert!(help.contains("/status"));
+        assert!(help.contains("/compact"));
+        assert!(help.contains("/model [model]"));
+        assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
+        assert!(help.contains("/clear [--confirm]"));
+        assert!(help.contains("/cost"));
+        assert!(help.contains("/resume <session-path>"));
+        assert!(help.contains("/config"));
+        assert!(help.contains("/memory"));
+        assert!(help.contains("/init"));
+        assert_eq!(slash_command_specs().len(), 11);
+        assert_eq!(resume_supported_slash_commands().len(), 8);
+    }
 
     #[test]
     fn compacts_sessions_via_slash_command() {
@@ -103,8 +335,40 @@ mod tests {
     }
 
     #[test]
-    fn ignores_unknown_slash_commands() {
+    fn help_command_is_non_mutating() {
+        let session = Session::new();
+        let result = handle_slash_command("/help", &session, CompactionConfig::default())
+            .expect("help command should be handled");
+        assert_eq!(result.session, session);
+        assert!(result.message.contains("Available commands:"));
+    }
+
+    #[test]
+    fn ignores_unknown_or_runtime_bound_slash_commands() {
         let session = Session::new();
         assert!(handle_slash_command("/unknown", &session, CompactionConfig::default()).is_none());
+        assert!(handle_slash_command("/status", &session, CompactionConfig::default()).is_none());
+        assert!(
+            handle_slash_command("/model claude", &session, CompactionConfig::default()).is_none()
+        );
+        assert!(handle_slash_command(
+            "/permissions read-only",
+            &session,
+            CompactionConfig::default()
+        )
+        .is_none());
+        assert!(handle_slash_command("/clear", &session, CompactionConfig::default()).is_none());
+        assert!(
+            handle_slash_command("/clear --confirm", &session, CompactionConfig::default())
+                .is_none()
+        );
+        assert!(handle_slash_command("/cost", &session, CompactionConfig::default()).is_none());
+        assert!(handle_slash_command(
+            "/resume session.json",
+            &session,
+            CompactionConfig::default()
+        )
+        .is_none());
+        assert!(handle_slash_command("/config", &session, CompactionConfig::default()).is_none());
     }
 }

@@ -24,9 +24,10 @@ impl UpstreamPaths {
             .as_ref()
             .canonicalize()
             .unwrap_or_else(|_| workspace_dir.as_ref().to_path_buf());
-        let repo_root = workspace_dir
+        let primary_repo_root = workspace_dir
             .parent()
             .map_or_else(|| PathBuf::from(".."), Path::to_path_buf);
+        let repo_root = resolve_upstream_repo_root(&primary_repo_root);
         Self { repo_root }
     }
 
@@ -51,6 +52,42 @@ pub struct ExtractedManifest {
     pub commands: CommandRegistry,
     pub tools: ToolRegistry,
     pub bootstrap: BootstrapPlan,
+}
+
+fn resolve_upstream_repo_root(primary_repo_root: &Path) -> PathBuf {
+    let candidates = upstream_repo_candidates(primary_repo_root);
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("src/commands.ts").is_file())
+        .unwrap_or_else(|| primary_repo_root.to_path_buf())
+}
+
+fn upstream_repo_candidates(primary_repo_root: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![primary_repo_root.to_path_buf()];
+
+    if let Some(explicit) = std::env::var_os("CLAUDE_CODE_UPSTREAM") {
+        candidates.push(PathBuf::from(explicit));
+    }
+
+    for ancestor in primary_repo_root.ancestors().take(4) {
+        candidates.push(ancestor.join("claude-code"));
+        candidates.push(ancestor.join("clawd-code"));
+    }
+
+    candidates.push(
+        primary_repo_root
+            .join("reference-source")
+            .join("claude-code"),
+    );
+    candidates.push(primary_repo_root.join("vendor").join("claude-code"));
+
+    let mut deduped = Vec::new();
+    for candidate in candidates {
+        if !deduped.iter().any(|seen: &PathBuf| seen == &candidate) {
+            deduped.push(candidate);
+        }
+    }
+    deduped
 }
 
 pub fn extract_manifest(paths: &UpstreamPaths) -> std::io::Result<ExtractedManifest> {

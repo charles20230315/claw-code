@@ -172,12 +172,12 @@ fn run_bash(input: BashCommandInput) -> Result<String, String> {
 
 fn run_read_file(input: &ReadFileInput) -> Result<String, String> {
     to_pretty_json(
-        read_file(&input.path, input.offset, input.limit).map_err(|error| error.to_string())?,
+        read_file(&input.path, input.offset, input.limit).map_err(|error| io_to_string(&error))?,
     )
 }
 
 fn run_write_file(input: &WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(|error| error.to_string())?)
+    to_pretty_json(write_file(&input.path, &input.content).map_err(|error| io_to_string(&error))?)
 }
 
 fn run_edit_file(input: &EditFileInput) -> Result<String, String> {
@@ -188,22 +188,26 @@ fn run_edit_file(input: &EditFileInput) -> Result<String, String> {
             &input.new_string,
             input.replace_all.unwrap_or(false),
         )
-        .map_err(|error| error.to_string())?,
+        .map_err(|error| io_to_string(&error))?,
     )
 }
 
 fn run_glob_search(input: &GlobSearchInputValue) -> Result<String, String> {
     to_pretty_json(
-        glob_search(&input.pattern, input.path.as_deref()).map_err(|error| error.to_string())?,
+        glob_search(&input.pattern, input.path.as_deref()).map_err(|error| io_to_string(&error))?,
     )
 }
 
 fn run_grep_search(input: &GrepSearchInput) -> Result<String, String> {
-    to_pretty_json(grep_search(input).map_err(|error| error.to_string())?)
+    to_pretty_json(grep_search(input).map_err(|error| io_to_string(&error))?)
 }
 
 fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
     serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
+}
+
+fn io_to_string(error: &std::io::Error) -> String {
+    error.to_string()
 }
 
 #[derive(Debug, Deserialize)]
